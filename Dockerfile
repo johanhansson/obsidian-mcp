@@ -1,12 +1,16 @@
-# MCP server image — used by CI to publish to ghcr.io
 FROM node:22-slim
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY tsconfig.json tsup.config.ts ./
+COPY src/ src/
+COPY lib/ lib/
 
-COPY dist/ dist/
+RUN npm ci
+RUN npm run build
+
+RUN npm ci --omit=dev
 
 EXPOSE 8787
 
