@@ -1,7 +1,7 @@
 {
     "name": "obsidian-sync-mcp",
     "mcpName": "io.github.es617/obsidian-sync-mcp",
-    "version": "0.5.7",
+    "version": "0.10.0",
     "description": "Give any AI agent access to your Obsidian vault over MCP",
     "type": "module",
     "license": "MIT",
@@ -29,19 +29,20 @@
         "LICENSE"
     ],
     "scripts": {
-        "lint": "npx --yes oxlint@latest --deny-warnings src/",
+        "lint": "npx --yes oxlint@1.86.0 --deny-warnings src/",
         "build": "tsup",
         "start": "node dist/main.js",
         "dev": "tsx src/main.ts",
         "test": "node --import tsx --test 'src/**/*.test.ts'",
-        "test:e2e": "node --import tsx --test test/e2e.test.ts"
+        "test:e2e": "node --import tsx --test test/e2e.test.ts",
+        "test:couchdb": "tsup test/couchdb-obfuscation.e2e.ts --out-dir .harness-tmp && node .harness-tmp/couchdb-obfuscation.e2e.js"
     },
     "dependencies": {
         "diff-match-patch": "^1.0.5",
         "fastmcp": "^3.34.0",
         "fflate": "^0.8.2",
-        "minimatch": "^9",
-        "octagonal-wheels": "^0.1.39",
+        "minimatch": "^10",
+        "octagonal-wheels": "^0.1.54",
         "pouchdb-adapter-http": "^9.0.0",
         "pouchdb-core": "^9.0.0",
         "pouchdb-errors": "^9.0.0",

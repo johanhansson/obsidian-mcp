@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Hono } from "hono";
 import { createHash, randomBytes } from "crypto";
-import { mountPasswordAuth } from "./auth.js";
+import { mountPasswordAuth, safeEqual } from "./auth.js";
 
 function setup(password = "test-password") {
     const app = new Hono();
@@ -124,6 +124,41 @@ describe("Dynamic Client Registration", () => {
         assert.ok(body.client_id);
         assert.ok(body.client_secret);
         assert.deepEqual(body.redirect_uris, ["https://x.com/cb"]);
+        assert.equal(body.token_endpoint_auth_method, "client_secret_post");
+    });
+
+    it("honors token_endpoint_auth_method: none — no client_secret issued", async () => {
+        const { app } = setup();
+        const resp = await app.request("/oauth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                client_name: "test",
+                redirect_uris: ["https://x.com/cb"],
+                token_endpoint_auth_method: "none",
+            }),
+        });
+        assert.equal(resp.status, 201);
+        const body = (await resp.json()) as any;
+        assert.equal(body.token_endpoint_auth_method, "none");
+        assert.equal(body.client_secret, undefined);
+    });
+
+    it("falls back to client_secret_post for an unrecognized auth method", async () => {
+        const { app } = setup();
+        const resp = await app.request("/oauth/register", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                client_name: "test",
+                redirect_uris: ["https://x.com/cb"],
+                token_endpoint_auth_method: "client_secret_basic",
+            }),
+        });
+        assert.equal(resp.status, 201);
+        const body = (await resp.json()) as any;
+        assert.equal(body.token_endpoint_auth_method, "client_secret_post");
+        assert.ok(body.client_secret);
     });
 });
 
@@ -192,6 +227,14 @@ describe("/oauth/authorize", () => {
         assert.ok(fields.code);
         assert.ok(fields.csrf);
     });
+
+    it("shows the redirect host on the consent page (phishing defense, GHSA-49hr-4pv9-75q6)", async () => {
+        const { app } = setup();
+        const pkce = generatePKCE();
+        const client = await registerClient(app, "https://evil.example/cb");
+        const { html } = await getAuthorizePage(app, client.client_id, pkce.challenge, "https://evil.example/cb");
+        assert.ok(html.includes("evil.example"), "consent page must display the redirect host");
+    });
 });
 
 describe("/oauth/approve — password validation", () => {
@@ -218,6 +261,31 @@ describe("/oauth/approve — password validation", () => {
         const resp = await submitPassword(app, fields.code, fields.csrf, "wrong");
         assert.equal(resp.status, 401);
         assert.ok((await resp.text()).includes("Wrong password"));
+    });
+
+    // Regression guard: this path compared byte lengths and never threw; it keeps
+    // safeEqual from changing that. The bug fixed on this path is the missing field below.
+    it("rejects a same-length non-ASCII password with 401", async () => {
+        const { app } = setup("test-password");
+        const client = await registerClient(app);
+        const pkce = generatePKCE();
+        const { fields } = await getAuthorizePage(app, client.client_id, pkce.challenge);
+        const resp = await submitPassword(app, fields.code, fields.csrf, "test-passworé");
+        assert.equal(resp.status, 401);
+        assert.ok((await resp.text()).includes("Wrong password"));
+    });
+
+    it("rejects a missing password field with 401, not 500", async () => {
+        const { app } = setup();
+        const client = await registerClient(app);
+        const pkce = generatePKCE();
+        const { fields } = await getAuthorizePage(app, client.client_id, pkce.challenge);
+        const resp = await app.request("/oauth/approve", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ code: fields.code, csrf: fields.csrf }).toString(),
+        });
+        assert.equal(resp.status, 401);
     });
 
     it("redirects with code and state on correct password", async () => {
@@ -373,6 +441,33 @@ describe("Token Exchange", () => {
         assert.equal(resp2.status, 400);
     });
 
+    it("rejects the authorize-page code when the password step was skipped (GHSA-cc9w-6w4g-hqv7)", async () => {
+        const { app } = setup();
+        const pkce = generatePKCE();
+        const client = await registerClient(app);
+        // Read the code straight out of the authorize page, as an attacker would,
+        // without ever POSTing to /oauth/approve.
+        const { fields } = await getAuthorizePage(app, client.client_id, pkce.challenge);
+
+        const tokenResp = await app.request("/oauth/token", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+                grant_type: "authorization_code",
+                code: fields.code,
+                client_id: client.client_id,
+                code_verifier: pkce.verifier,
+                redirect_uri: "https://app.example.com/callback",
+            }).toString(),
+        });
+        assert.equal(tokenResp.status, 400);
+        const body = (await tokenResp.json()) as any;
+        assert.equal(body.error, "invalid_grant");
+
+        // And no usable token was minted.
+        assert.equal(body.access_token, undefined);
+    });
+
     it("rejects unsupported grant_type", async () => {
         const { app } = setup();
         const resp = await app.request("/oauth/token", {
@@ -445,5 +540,22 @@ describe("validateToken", () => {
         const { app, validateToken } = setup();
         const tokens = await completeOAuthFlow(app, "test-password");
         assert.ok(validateToken(`Bearer ${tokens.access_token}`));
+    });
+});
+
+describe("safeEqual", () => {
+    it("matches identical strings", () => {
+        assert.equal(safeEqual("Bearer abc", "Bearer abc"), true);
+    });
+
+    it("rejects different strings of equal and unequal length", () => {
+        assert.equal(safeEqual("Bearer abc", "Bearer abd"), false);
+        assert.equal(safeEqual("Bearer abc", "Bearer abcd"), false);
+        assert.equal(safeEqual("", "Bearer abc"), false);
+    });
+
+    it("does not throw when byte lengths differ but string lengths match", () => {
+        // "é" is one UTF-16 unit but two UTF-8 bytes: the case that made timingSafeEqual throw.
+        assert.equal(safeEqual("Bearer abcé", "Bearer abcd"), false);
     });
 });
