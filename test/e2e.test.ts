@@ -124,6 +124,66 @@ describe("E2E: Auth", () => {
         });
         assert.equal(resp.status, 401);
     });
+
+    it("rejects a non-ASCII bearer token with a normal 401", async () => {
+        // Same string length as the real header but more UTF-8 bytes; this used to
+        // throw inside the token check and surface the crypto error in the response.
+        const forged = `Bearer ${AUTH.slice(0, -1)}é`;
+        const resp = await fetch(BASE, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": forged },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "e2e", version: "1.0" } } }),
+        });
+        assert.equal(resp.status, 401);
+        assert.ok(resp.headers.get("www-authenticate")?.includes("resource_metadata="));
+        assert.ok(!(await resp.text()).includes("byte length"));
+    });
+});
+
+describe("E2E: search_notes", () => {
+    it("opens with the index status line and returns a hit with a snippet, never the body", async () => {
+        const text = await callTool("search_notes", { terms: ["hello"] });
+        const lines = text.split("\n");
+        assert.match(lines[0], /^Index: local vault, no sequence — \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+ \(\d{2}:\d{2}Z\); 3 of 3 notes with content\.$/);
+        assert.equal(lines[1], '1 note matches "hello". Call read_note on a hit before relying on it.');
+        assert.match(lines[2], /^- \S* \[Welcome\.md\]\(obsidian:\/\/open\?vault=TestVault&file=Welcome\)$/);
+        assert.match(lines[3], /^  .*Hello world/);
+        assert.ok(!text.includes("# Welcome\nHello"), "the note body is not returned");
+    });
+
+    it("OR-combines terms and searches case-insensitively", async () => {
+        const text = await callTool("search_notes", { terms: ["DAILY NOTE", "[[welcome]]"] });
+        assert.match(text.split("\n")[1], /^2 notes match/);
+        assert.ok(text.includes("daily/2026-03-24.md"));
+        assert.ok(text.includes("projects/test.md"));
+    });
+
+    it("honours folder and tag filters", async () => {
+        const inFolder = await callTool("search_notes", { terms: ["daily", "welcome"], folder: "daily" });
+        assert.match(inFolder.split("\n")[1], /^1 note matches/);
+        const byTag = await callTool("search_notes", { terms: ["hello", "daily"], tag: "intro" });
+        assert.match(byTag.split("\n")[1], /^1 note matches/);
+        assert.ok(byTag.includes("Welcome.md"));
+    });
+
+    it("searches path and title first and lists such hits on top, marked", async () => {
+        const text = await callTool("search_notes", { terms: ["welcome"] });
+        const lines = text.split("\n");
+        assert.match(lines[1], /^2 notes match "welcome"\. 1 hit by path or title listed first\./);
+        assert.match(lines[2], /\[Welcome\.md\]/);
+        assert.match(lines[3], /^  \[path\/title\] /, "Welcome.md matches by path (and title) and by body");
+        assert.match(lines[4], /\[projects\/test\.md\]/);
+        assert.match(lines[5], /^  [^\[]/, "projects/test.md is a content-only hit");
+        const byFolderName = await callTool("search_notes", { terms: ["projects/"] });
+        assert.match(byFolderName.split("\n")[3], /^  \[path\/title match\]$/);
+    });
+
+    it("says so on zero hits and rejects an empty query", async () => {
+        const none = await callTool("search_notes", { terms: ["no-such-phrase"] });
+        assert.equal(none.split("\n")[1], 'No notes match "no-such-phrase".');
+        assert.equal(await callTool("search_notes", {}), "Give at least one term.");
+        assert.equal(await callTool("search_notes", { terms: ["  "] }), "Give at least one term.");
+    });
 });
 
 describe("E2E: list_notes", () => {
@@ -142,7 +202,32 @@ describe("E2E: list_notes", () => {
 
     it("sorts by modified with limit", async () => {
         const text = await callTool("list_notes", { sort_by: "modified", limit: 2 });
-        assert.ok(text.includes("more"));
+        assert.ok(text.startsWith("Showing 2 of 3 notes"), text);
+    });
+
+    // Regression tests for #19: a client must be able to tell a truncated or
+    // filtered listing from a complete one, and a zero-hit filter must not
+    // claim the vault is empty.
+    it("starts with a status line that names what the limit cut", async () => {
+        const text = await callTool("list_notes", { limit: 2 });
+        const firstLine = text.split("\n")[0];
+        assert.ok(firstLine.startsWith("Showing 2 of 3 notes"), firstLine);
+        assert.ok(firstLine.includes("Omitted 1: (root) (1)"), firstLine);
+    });
+
+    it("states the total on a complete listing", async () => {
+        const text = await callTool("list_notes");
+        assert.equal(text.split("\n")[0], "3 notes (sorted by name).");
+    });
+
+    it("keeps the filter visible on a complete filtered listing", async () => {
+        const text = await callTool("list_notes", { tag: "intro" });
+        assert.equal(text.split("\n")[0], '1 note matches tag="intro" (vault has 3 notes, sorted by name).');
+    });
+
+    it("does not claim the vault is empty on a zero-hit filter", async () => {
+        const text = await callTool("list_notes", { name: "no-such-note" });
+        assert.equal(text, 'No notes match name="no-such-note" (vault has 3 notes).');
     });
 
     it("filters by tag", async () => {
@@ -237,10 +322,63 @@ describe("E2E: move_note", () => {
 });
 
 describe("E2E: delete_note", () => {
+    it("does not claim to have deleted a note that does not exist", async () => {
+        const text = await callTool("delete_note", { path: "archive/never-existed.md" });
+        assert.equal(text, "Note not found: archive/never-existed.md");
+    });
+
     it("deletes a note", async () => {
         const text = await callTool("delete_note", { path: "archive/ci-test.md" });
         assert.ok(text.includes("Deleted"));
         assert.ok(!existsSync(join(vaultDir, "archive/ci-test.md")));
+    });
+});
+
+// Regression for #18: mcp-proxy 6.7.x crashed with a TypeError on any request
+// speaking MCP protocol revision 2026-07-28+ (current Claude clients), while
+// legacy-handshake requests — everything else in this suite — kept working.
+// These requests must get a JSON-RPC error or a session, never a 500/crash.
+describe("E2E: modern-protocol requests must not crash the server", () => {
+    async function modernRequest(body: any, extraHeaders: Record<string, string> = {}) {
+        const resp = await fetch(BASE, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": `Bearer ${AUTH}`,
+                "MCP-Protocol-Version": "2026-07-28",
+                ...extraHeaders,
+            },
+            body: JSON.stringify(body),
+        });
+        return parseSSE(await resp.text());
+    }
+
+    it("survives a modern server/discover request", async () => {
+        const resp = await modernRequest({
+            jsonrpc: "2.0", id: 90, method: "server/discover",
+            params: {
+                _meta: {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                clientInfo: { name: "e2e-modern", version: "1.0" },
+            },
+        }, { "Mcp-Method": "server/discover" });
+        assert.notEqual(resp?.error?.code, -32603, `internal server error: ${JSON.stringify(resp)}`);
+    });
+
+    it("survives an initialize claiming a modern protocol version", async () => {
+        const resp = await modernRequest({
+            jsonrpc: "2.0", id: 91, method: "initialize",
+            params: { protocolVersion: "2026-07-28", capabilities: {}, clientInfo: { name: "e2e-modern", version: "1.0" } },
+        });
+        assert.notEqual(resp?.error?.code, -32603, `internal server error: ${JSON.stringify(resp)}`);
+    });
+
+    it("still serves the legacy session afterwards", async () => {
+        const text = await callTool("list_notes", {});
+        assert.ok(text.length > 0);
     });
 });
 
@@ -308,6 +446,13 @@ describe("E2E: cold restart with persisted index", () => {
 
         // Restart server
         await startServer({ VAULT_PATH: vaultDir, VAULT_NAME: "TestVault" });
+
+        // The server accepts connections while the index rebuild runs in the
+        // background — wait for the rebuild to finish before asserting.
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline && !serverLogs.includes("Search index built")) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
         const restartLogs = serverLogs;
 
         // Should rebuild search index from vault files

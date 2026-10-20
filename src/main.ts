@@ -1,14 +1,17 @@
 import { FastMCP } from "fastmcp";
 import { join } from "path";
-import { timingSafeEqual, createHash } from "crypto";
+import { createHash } from "crypto";
 import { watch, readFileSync, statSync } from "fs";
 import { stat } from "fs/promises";
 import { setGlobalLogFunction, LEVEL_INFO } from "octagonal-wheels/common/logger";
-import { mountPasswordAuth } from "./auth.js";
+import { mountPasswordAuth, safeEqual } from "./auth.js";
 import { SearchIndex } from "./search.js";
-import { applyIndexChange } from "./index-sync.js";
+import { applyIndexChange, pruneGhosts } from "./index-sync.js";
 import { buildAllowedHosts, isHostAllowed, isOriginAllowed } from "./host-guard.js";
+import { readOnlyVault } from "./vault-readonly.js";
 import { registerTools } from "./tools.js";
+import { parseWriteFolders } from "./write-scope.js";
+import { redactCredentials, describeError, describeLogMessage } from "./redact.js";
 
 // Suppress livesync-commonlib logs that expose vault file paths in production.
 // Set LOG_LEVEL=debug to see all library logs during development.
@@ -19,7 +22,8 @@ setGlobalLogFunction((message, level = LEVEL_INFO) => {
         if (/^(GET|PUT|DELETE|WATCH|FOLLOW|Sensible merge|Object merge):/.test(message)) return;
         if (message.includes("replicator") || message.includes("Replicator") || message.includes("ReplicatorService")) return;
     }
-    console.log(message);
+    // The library also logs raw Error objects and other values, not only strings.
+    console.log(describeLogMessage(message, debugLogging));
 });
 
 // --- Configuration from environment ---
@@ -30,11 +34,14 @@ const COUCHDB_PASSWORD = process.env.COUCHDB_PASSWORD;
 const COUCHDB_DATABASE = process.env.COUCHDB_DATABASE ?? "obsidian";
 const COUCHDB_PASSPHRASE = process.env.COUCHDB_PASSPHRASE || undefined;
 const COUCHDB_OBFUSCATE_PROPERTIES = process.env.COUCHDB_OBFUSCATE_PROPERTIES === "true";
+const COUCHDB_ID_DERIVATION_KEY = process.env.COUCHDB_ID_DERIVATION_KEY || undefined;
+const COUCHDB_CASE_SENSITIVE = process.env.COUCHDB_CASE_SENSITIVE === "true";
 const VAULT_NAME = process.env.VAULT_NAME ?? "MyVault";
 const PORT = parseInt(process.env.PORT ?? "8787");
 const BASE_URL = process.env.BASE_URL ?? `http://localhost:${PORT}`;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const READ_ONLY = process.env.READ_ONLY === "true";
+const WRITE_FOLDERS = parseWriteFolders(process.env.WRITE_FOLDERS);
 
 // Extra instructions appended to the MCP `instructions` string.
 // File wins if both are set (loud warning); missing file is fatal.
@@ -82,15 +89,26 @@ if (VAULT_PATH) {
         database: COUCHDB_DATABASE,
         passphrase: COUCHDB_PASSPHRASE,
         obfuscatePaths: COUCHDB_OBFUSCATE_PROPERTIES,
+        idDerivationKey: COUCHDB_ID_DERIVATION_KEY,
+        caseSensitive: COUCHDB_CASE_SENSITIVE,
     });
-    console.log(`Remote mode: ${COUCHDB_URL}`);
+    console.log(`Remote mode: ${redactCredentials(COUCHDB_URL)}`);
 } else {
     console.error("Set VAULT_PATH for local mode or COUCHDB_URL for remote mode.");
     process.exit(1);
 }
 
-await vault.init();
+try {
+    await vault.init();
+} catch (err) {
+    console.error(`Failed to open the vault: ${describeError(err, debugLogging)}`);
+    process.exit(1);
+}
 console.log("Vault ready.");
+
+// READ_ONLY also hides the write tools (see registerTools); wrapping the backend
+// makes any write that bypasses the tools fail too.
+if (READ_ONLY) vault = readOnlyVault(vault);
 
 // --- Per-vault data directory ---
 const baseDataDir = process.env.DATA_DIR ?? join(process.env.HOME ?? process.env.USERPROFILE ?? "/tmp", ".obsidian-mcp");
@@ -106,43 +124,72 @@ await searchIndex.loadFromDisk();
 if (debugLogging) {
     console.log(`[debug] Persisted metadata: ${searchIndex.size} notes, since: ${searchIndex.since || "(none)"}`);
 }
+// The persisted file carries metadata (paths, mtimes, tags, links) but no note
+// text, since bodies are never written to disk. Keep that metadata serveable
+// right away — list_notes, tags and backlinks answer from the first request —
+// and re-read every body from sequence zero to repopulate the in-memory search
+// text. A from-zero _changes pass refreshes metadata and removes notes deleted
+// while the server was down, so nothing kept from disk goes stale. (Clearing
+// here instead would discard the metadata and leave list_notes empty on a
+// path-obfuscated vault until the full rebuild finishes.)
+if (searchIndex.size > 0 && searchIndex.contentCount < searchIndex.size) {
+    console.log(`Persisted metadata for ${searchIndex.size} notes has no text; re-reading note bodies from the start so search_notes covers every note (metadata stays serveable meanwhile).`);
+    searchIndex.since = "0";
+}
 
 // Sync metadata in background (server starts immediately)
 async function rebuildIndex() {
     const start = performance.now();
 
     if (COUCHDB_URL && vault.catchUp) {
-        const changeCallback = (path: string, content: string | null, mtime?: number) => {
-            // content === "" is an empty-but-present note: index it, don't drop it.
-            applyIndexChange(searchIndex, path, content, mtime);
-        };
-
-        let since = searchIndex.since || "0";
+        const since = searchIndex.since || "0";
         if (debugLogging) console.log(`[debug] CouchDB catch-up from since: ${since}`);
         let changes = 0;
+        // Ghosts (notes that vanished while the server was down) can only be among
+        // the paths already loaded from the persisted file: a from-zero pass
+        // re-delivers every live note, so a loaded path it does not deliver is
+        // gone. A remote "Rebuild database" recreates the DB with no tombstones to
+        // replay, so this is the only way to catch those deletions. Snapshot the
+        // loaded paths up front and track which the pass re-delivers; limiting the
+        // prune to pre-existing paths means a note the live watcher adds mid-pass
+        // is never pruned.
+        const preexisting = new Set(searchIndex.listPaths());
+        const seen = new Set<string>();
+        let fromZero = since === "0";
         const onBatch = async (batchSince: string, processed: number) => {
             searchIndex.since = batchSince;
             await searchIndex.saveToDisk();
             console.log(`  checkpoint: ${processed} changes processed, ${searchIndex.size} notes indexed.`);
         };
+        const countingCallback = (path: string, content: string | null, mtime?: number) => {
+            changes++;
+            if (debugLogging) console.log(`[debug] Change: ${path} ${content !== null ? "(update)" : "(delete)"}`);
+            if (content !== null) seen.add(path); else seen.delete(path);
+            // content === "" is an empty-but-present note: index it, don't drop it.
+            applyIndexChange(searchIndex, path, content, mtime);
+        };
         try {
-            const countingCallback = (path: string, content: string | null, mtime?: number) => {
-                changes++;
-                if (debugLogging) console.log(`[debug] Change: ${path} ${content !== null ? "(update)" : "(delete)"}`);
-                changeCallback(path, content, mtime);
-            };
             const newSince = await vault.catchUp(since, countingCallback, onBatch);
             searchIndex.since = newSince;
+            searchIndex.lastSyncAt = Date.now();
         } catch (err) {
-            console.warn(`Catch-up failed (${err}), rebuilding index from scratch...`);
-            searchIndex.clear();
+            // Re-read from the start, but don't clear() first: a from-zero pass
+            // repopulates everything, and clearing would discard the still-serveable
+            // persisted metadata and — if this retry also fails — leave an empty
+            // index that the periodic save would then persist over the good copy.
+            console.warn(`Catch-up failed (${describeError(err, debugLogging)}), re-reading from the start...`);
             changes = 0;
-            const newSince = await vault.catchUp("0", (path, content, mtime) => {
-                changes++;
-                changeCallback(path, content, mtime);
-            }, onBatch);
+            seen.clear();
+            fromZero = true;
+            const newSince = await vault.catchUp("0", countingCallback, onBatch);
             searchIndex.since = newSince;
+            searchIndex.lastSyncAt = Date.now();
         }
+        // Drop loaded paths a completed from-zero pass did not re-deliver. A note
+        // the watcher adds mid-pass is never pruned (it is not in `preexisting`);
+        // one the watcher re-adds between the pass and the prune is re-added by
+        // the next pre-search catch-up, so any race is self-correcting.
+        if (fromZero) pruneGhosts(searchIndex, preexisting, seen);
         if (changes > 0) {
             console.log(`Search index synced: ${changes} changes in ${((performance.now() - start) / 1000).toFixed(1)}s (${searchIndex.size} notes).`);
         } else {
@@ -170,9 +217,60 @@ async function rebuildIndex() {
         }
     }
     await searchIndex.saveToDisk();
+    searchIndex.state = "ready";
+    // Start the live watcher only now: the catch-up has advanced `since` to the
+    // live tip, so the watcher resumes from there. Starting it at boot (before
+    // the catch-up set `since`) made it replay the whole feed from seq 0
+    // alongside the catch-up — a duplicate decrypt pass that roughly doubled
+    // startup on large vaults. No changes are missed: the catch-up drains to the
+    // current tip, the watcher continues from it.
+    if (COUCHDB_URL && vault.watchChanges) startCouchDbWatcher();
 }
 // Fire and forget — server starts while index builds
-rebuildIndex().catch((err) => console.error("Index rebuild failed:", err));
+rebuildIndex().catch((err) => {
+    searchIndex.state = "failed";
+    console.error(`Index rebuild failed: ${describeError(err, debugLogging)}`);
+    // Still start the watcher so live updates recover: it replays from the last
+    // sequence the manipulator reached (seq 0 on a cold start) and reconnects on
+    // its own. On the success path the watcher is already started inside
+    // rebuildIndex(); beginWatch() guards against a double start.
+    if (COUCHDB_URL && vault.watchChanges) startCouchDbWatcher();
+});
+
+// --- Pre-search catch-up ---
+// search_notes calls this before every search so a hit can never predate the
+// vault: one `_changes` request from the index's own sequence (milliseconds
+// when nothing changed), applied through the same applyIndexChange path as
+// the startup rebuild and the watcher. Calls are serialized so two searches
+// cannot interleave their batches. Errors are returned, never thrown: the
+// search still runs on the index as it is and the status line says so.
+let syncChain: Promise<unknown> = Promise.resolve();
+async function syncBeforeSearch(): Promise<{ unreadable: number; error?: string }> {
+    if (!(COUCHDB_URL && vault.catchUp) || searchIndex.state !== "ready") return { unreadable: 0 };
+    const run = async () => {
+        const stats = { unreadable: 0 };
+        try {
+            const newSince = await vault.catchUp!(
+                searchIndex.since || "0",
+                (path, content, mtime) => applyIndexChange(searchIndex, path, content, mtime),
+                undefined,
+                stats,
+            );
+            searchIndex.since = newSince;
+            searchIndex.lastSyncAt = Date.now();
+            return { unreadable: stats.unreadable };
+        } catch (err) {
+            // Log the detail (credentials redacted) server-side; the status line
+            // shown to the client gets a short reason, not a raw backend error
+            // that would disclose internal hostnames or URLs.
+            console.warn(`Pre-search catch-up failed: ${describeError(err, debugLogging)}`);
+            return { unreadable: stats.unreadable, error: "CouchDB sync error" };
+        }
+    };
+    const result = syncChain.then(run, run);
+    syncChain = result.catch(() => undefined);
+    return result;
+}
 
 // --- Watch for external changes ---
 let fsWatcher: ReturnType<typeof watch> | null = null;
@@ -205,13 +303,20 @@ if (VAULT_PATH) {
         }
     }
     console.log("Watching vault for external changes.");
-} else if (COUCHDB_URL && vault.watchChanges) {
-    // Remote mode: watch CouchDB _changes feed for LiveSync updates
-    vault.watchChanges((path: string, content: string | null, mtime?: number, seq?: string | number) => {
+}
+
+// Remote mode: watch the CouchDB _changes feed for LiveSync updates. Called from
+// rebuildIndex() after the initial catch-up, so the watcher resumes from the
+// caught-up `since` rather than replaying the whole feed from seq 0.
+function startCouchDbWatcher() {
+    vault.watchChanges!((path: string, content: string | null, mtime?: number, seq?: string | number) => {
         if (debugLogging) console.log(`[debug] CouchDB ${content === null ? "delete" : "change"}: ${path}`);
         // content === "" is an empty-but-present note: index it, don't drop it.
         applyIndexChange(searchIndex, path, content, mtime);
-        if (seq) searchIndex.since = String(seq);
+        if (seq) {
+            searchIndex.since = String(seq);
+            searchIndex.lastSyncAt = Date.now();
+        }
     });
     console.log("Watching CouchDB for LiveSync changes.");
 }
@@ -233,14 +338,19 @@ if (AUTH_TOKEN) {
         const header = req.headers["authorization"];
         // Accept static Bearer token (for curl, MCP Inspector, custom agents)
         const expected = `Bearer ${AUTH_TOKEN}`;
-        if (header && header.length === expected.length && timingSafeEqual(Buffer.from(header), Buffer.from(expected))) {
+        if (header && safeEqual(header, expected)) {
             return { authenticated: true };
         }
         // Accept OAuth-issued tokens (for Claude Web/Desktop/Mobile)
         if (auth?.validateToken(header)) {
             return { authenticated: true };
         }
-        throw new Response("Unauthorized", { status: 401 });
+        // RFC 9728: point strict clients (e.g. Gemini) at the resource
+        // metadata; Claude probes /.well-known directly but others rely on this.
+        throw new Response("Unauthorized", {
+            status: 401,
+            headers: { "WWW-Authenticate": `Bearer resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"` },
+        });
     };
     console.log("Auth enabled (password-gated OAuth).");
 } else {
@@ -277,7 +387,7 @@ if (AUTH_TOKEN) {
 }
 
 // --- Tools ---
-registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY);
+registerTools(server, vault, searchIndex, VAULT_NAME, READ_ONLY, WRITE_FOLDERS, COUCHDB_URL ? syncBeforeSearch : undefined);
 
 // --- Graceful shutdown ---
 async function shutdown() {
@@ -309,5 +419,5 @@ console.log(`obsidian-sync-mcp v${process.env.npm_package_version ?? "unknown"} 
 
 // Prevent unhandled rejections from crashing the server (e.g. decryption failures in watcher)
 process.on("unhandledRejection", (err) => {
-    console.error("Unhandled rejection:", err);
+    console.error(`Unhandled rejection: ${describeError(err, debugLogging)}`);
 });

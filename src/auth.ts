@@ -26,6 +26,7 @@ interface PendingAuth {
     state: string;
     code: string;
     createdAt: number;
+    approved: boolean;
 }
 
 interface TokenRecord {
@@ -38,9 +39,11 @@ interface TokenRecord {
 
 interface RegisteredClient {
     clientId: string;
-    clientSecret: string;
+    clientSecret?: string;
+    tokenEndpointAuthMethod: "client_secret_post" | "none";
     redirectUris: string[];
     clientName?: string;
+    createdAt?: number;
 }
 
 const TOKEN_EXPIRY_MS = 3600 * 1000; // 1 hour
@@ -51,6 +54,17 @@ const BASE_LOCKOUT_MS = 5 * 1000; // 5 seconds, doubles each lockout
 const MAX_CLIENTS = 100;
 const MAX_PENDING = 100;
 const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Constant-time string comparison for secrets. Comparing SHA-256 digests gives
+ * timingSafeEqual equal-length inputs, so it never throws on a length or
+ * encoding mismatch and the secret's length is not revealed.
+ */
+export function safeEqual(a: string, b: string): boolean {
+    const da = createHash("sha256").update(a).digest();
+    const db = createHash("sha256").update(b).digest();
+    return timingSafeEqual(da, db);
+}
 
 export interface AuthHandle {
     validateToken: (auth: string | undefined) => boolean;
@@ -81,6 +95,28 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
     let failedAttempts = 0;
     let lockoutCount = 0;
     let lockedUntil = 0;
+
+    // Persist clients + tokens. Called on every state change (not just the
+    // periodic save): a restart or Fly suspend right after registration or
+    // token issuance must not lose the new state.
+    async function persist(): Promise<void> {
+        if (!persistPath) return;
+        try {
+            await mkdir(dirname(persistPath), { recursive: true });
+            const now = Date.now();
+            const activeTokens = [...tokens.entries()].filter(([, r]) => r.expiresAt > now);
+            const activeRefresh = [...refreshTokens.entries()].filter(([, r]) => r.refreshExpiresAt > now);
+            const data = JSON.stringify({
+                tokens: Object.fromEntries(activeTokens),
+                refreshTokens: Object.fromEntries(activeRefresh),
+                clients: Object.fromEntries(clients),
+            });
+            await writeFile(persistPath, data, { encoding: "utf-8", mode: 0o600 });
+            await chmod(persistPath, 0o600);
+        } catch (err) {
+            console.error("Failed to save auth tokens:", err);
+        }
+    }
 
     // HTTPS warning
     if (!baseUrl.startsWith("https://") && !baseUrl.includes("localhost")) {
@@ -115,7 +151,20 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
 
     app.post("/oauth/register", async (c) => {
         if (clients.size >= MAX_CLIENTS) {
-            return c.json({ error: "too_many_clients" }, 429);
+            // Evict the oldest client with no live tokens to make room; only
+            // reject when every slot is held by a client with active tokens.
+            const activeClientIds = new Set<string>();
+            for (const r of tokens.values()) activeClientIds.add(r.clientId);
+            for (const r of refreshTokens.values()) activeClientIds.add(r.clientId);
+            let oldest: RegisteredClient | undefined;
+            for (const client of clients.values()) {
+                if (activeClientIds.has(client.clientId)) continue;
+                if (!oldest || (client.createdAt ?? 0) < (oldest.createdAt ?? 0)) oldest = client;
+            }
+            if (!oldest) {
+                return c.json({ error: "too_many_clients" }, 429);
+            }
+            clients.delete(oldest.clientId);
         }
         const body = await c.req.json();
 
@@ -134,23 +183,37 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
         }
 
         const clientId = randomUUID();
-        const clientSecret = randomBytes(32).toString("hex");
+        // Honor the client's requested auth method (RFC 7591 §2). Only
+        // "client_secret_post" and "none" are advertised as supported, so
+        // anything else falls back to the confidential-client default rather
+        // than silently registering a method we don't understand.
+        const tokenEndpointAuthMethod: "client_secret_post" | "none" =
+            body.token_endpoint_auth_method === "none" ? "none" : "client_secret_post";
+        const clientSecret = tokenEndpointAuthMethod === "none" ? undefined : randomBytes(32).toString("hex");
         const clientName = typeof body.client_name === "string" ? body.client_name.slice(0, 256) : undefined;
 
         const client: RegisteredClient = {
             clientId,
             clientSecret,
+            tokenEndpointAuthMethod,
             redirectUris,
             clientName,
+            createdAt: Date.now(),
         };
         clients.set(clientId, client);
+        await persist();
+
+        console.log(
+            `Auth: registered client_id=${clientId} redirect_uris=${JSON.stringify(redirectUris)} ` +
+            `requested_auth_method=${JSON.stringify(body.token_endpoint_auth_method ?? "(unspecified)")} (responding with ${tokenEndpointAuthMethod})`
+        );
 
         return c.json({
             client_id: clientId,
-            client_secret: clientSecret,
+            ...(clientSecret ? { client_secret: clientSecret } : {}),
             redirect_uris: client.redirectUris,
             client_name: client.clientName,
-            token_endpoint_auth_method: "client_secret_post",
+            token_endpoint_auth_method: tokenEndpointAuthMethod,
         }, 201);
     });
 
@@ -166,14 +229,20 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
         // Validate redirect URI against registered client
         const client = clients.get(clientId);
         if (!client) {
+            console.warn(`Auth: /oauth/authorize unknown client_id=${JSON.stringify(clientId)}`);
             return c.text("Unknown client", 400);
         }
         if (!client.redirectUris.includes(redirectUri)) {
+            console.warn(
+                `Auth: /oauth/authorize redirect_uri mismatch. received=${JSON.stringify(redirectUri)} ` +
+                `registered=${JSON.stringify(client.redirectUris)}`
+            );
             return c.text("Invalid redirect URI", 400);
         }
 
         // Require S256 PKCE
         if (codeChallengeMethod !== "S256" || !codeChallenge) {
+            console.warn(`Auth: /oauth/authorize missing/unsupported PKCE. method=${JSON.stringify(codeChallengeMethod)} challenge_present=${!!codeChallenge}`);
             return c.text("PKCE with S256 is required", 400);
         }
 
@@ -191,11 +260,14 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             state,
             code,
             createdAt: Date.now(),
+            approved: false,
         });
+
+        console.log(`Auth: /oauth/authorize accepted client_id=${clientId} redirect_uri=${JSON.stringify(redirectUri)}`);
 
         const csrf = randomBytes(32).toString("hex");
         csrfTokens.set(code, csrf);
-        return c.html(renderPasswordPage(code, csrf));
+        return c.html(renderPasswordPage(code, csrf, hostOf(redirectUri), client.clientName));
     });
 
     // --- Approval handler ---
@@ -213,9 +285,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
         }
 
         // Validate CSRF token
-        const csrfA = Buffer.from(submittedCsrf ?? "");
-        const csrfB = Buffer.from(expectedCsrf);
-        if (csrfA.length !== csrfB.length || !timingSafeEqual(csrfA, csrfB)) {
+        if (typeof submittedCsrf !== "string" || !safeEqual(submittedCsrf, expectedCsrf)) {
             return c.html("<p>Invalid request.</p>", 403);
         }
 
@@ -225,12 +295,10 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             console.warn(`Auth: locked out, ${waitSec}s remaining`);
             const newCsrf = randomBytes(32).toString("hex");
             csrfTokens.set(code, newCsrf);
-            return c.html(renderPasswordPage(code, newCsrf, `Too many attempts. Try again in ${waitSec} seconds.`), 429);
+            return c.html(renderPasswordPage(code, newCsrf, hostOf(pending.redirectUri), clients.get(pending.clientId)?.clientName, `Too many attempts. Try again in ${waitSec} seconds.`), 429);
         }
 
-        const a = Buffer.from(submittedPassword);
-        const b = Buffer.from(password);
-        if (a.length !== b.length || !timingSafeEqual(a, b)) {
+        if (typeof submittedPassword !== "string" || !safeEqual(submittedPassword, password)) {
             failedAttempts++;
             console.warn(`Auth: failed attempt ${failedAttempts} total`);
 
@@ -243,10 +311,10 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
                 const lockoutMs = BASE_LOCKOUT_MS * Math.pow(2, lockoutCount - 1);
                 lockedUntil = Date.now() + lockoutMs;
                 console.warn(`Auth: lockout #${lockoutCount}, ${lockoutMs / 1000}s`);
-                return c.html(renderPasswordPage(code, newCsrf, `Too many attempts. Try again in ${Math.ceil(lockoutMs / 1000)} seconds.`), 429);
+                return c.html(renderPasswordPage(code, newCsrf, hostOf(pending.redirectUri), clients.get(pending.clientId)?.clientName, `Too many attempts. Try again in ${Math.ceil(lockoutMs / 1000)} seconds.`), 429);
             }
 
-            return c.html(renderPasswordPage(code, newCsrf, "Wrong password."), 401);
+            return c.html(renderPasswordPage(code, newCsrf, hostOf(pending.redirectUri), clients.get(pending.clientId)?.clientName, "Wrong password."), 401);
         }
 
         // Password correct — reset everything
@@ -254,6 +322,10 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
         lockoutCount = 0;
         lockedUntil = 0;
         csrfTokens.delete(code);
+        // Mark the code redeemable only now that the password has been verified.
+        // Without this, /oauth/token would accept the code straight out of the
+        // authorize page before any password was entered.
+        pending.approved = true;
         console.log("Auth: password accepted, issuing authorization code.");
 
         const url = new URL(pending.redirectUri);
@@ -269,6 +341,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
     app.post("/oauth/token", async (c) => {
         const body = await c.req.parseBody();
         const grantType = body["grant_type"] as string;
+        console.log(`Auth: /oauth/token request grant_type=${JSON.stringify(grantType)}`);
 
         if (grantType === "authorization_code") {
             const code = body["code"] as string;
@@ -278,17 +351,36 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
 
             const pending = pendingAuths.get(code);
             if (!pending || Date.now() - pending.createdAt > PENDING_TTL_MS) {
+                console.warn(
+                    `Auth: /oauth/token invalid_grant. code_known=${!!pending} ` +
+                    `expired=${pending ? Date.now() - pending.createdAt > PENDING_TTL_MS : "n/a"}`
+                );
                 if (pending) pendingAuths.delete(code);
                 return c.json({ error: "invalid_grant" }, 400);
             }
 
+            // The code is only redeemable once the password step succeeded.
+            // It exists in pendingAuths from /oauth/authorize onward (and is
+            // present in the authorize page HTML), so without this check the
+            // password gate can be bypassed entirely.
+            if (!pending.approved) {
+                console.warn("Auth: /oauth/token invalid_grant. code not yet approved (password step not completed)");
+                return c.json({ error: "invalid_grant", error_description: "authorization not approved" }, 400);
+            }
+
             // Verify client_id matches the original request
             if (clientId !== pending.clientId) {
+                console.warn(
+                    `Auth: /oauth/token client_id mismatch. received=${JSON.stringify(clientId)} expected=${JSON.stringify(pending.clientId)}`
+                );
                 return c.json({ error: "invalid_grant", error_description: "client_id mismatch" }, 400);
             }
 
             // Verify redirect_uri matches the original request
             if (redirectUri !== pending.redirectUri) {
+                console.warn(
+                    `Auth: /oauth/token redirect_uri mismatch. received=${JSON.stringify(redirectUri)} expected=${JSON.stringify(pending.redirectUri)}`
+                );
                 return c.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
             }
 
@@ -298,11 +390,13 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
                     .update(codeVerifier)
                     .digest("base64url");
                 if (expected !== pending.codeChallenge) {
+                    console.warn("Auth: /oauth/token PKCE verification failed");
                     return c.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
                 }
             }
 
             pendingAuths.delete(code);
+            console.log(`Auth: /oauth/token issuing access token client_id=${pending.clientId}`);
 
             const accessToken = randomBytes(32).toString("hex");
             const refreshToken = randomBytes(32).toString("hex");
@@ -315,6 +409,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             };
             tokens.set(accessToken, record);
             refreshTokens.set(refreshToken, record);
+            await persist();
 
             return c.json({
                 access_token: accessToken,
@@ -328,6 +423,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             const refreshToken = body["refresh_token"] as string;
             const old = refreshTokens.get(refreshToken);
             if (!old) {
+                console.warn("Auth: /oauth/token refresh_token unknown");
                 return c.json({ error: "invalid_grant" }, 400);
             }
 
@@ -353,6 +449,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             };
             tokens.set(accessToken, record);
             refreshTokens.set(newRefreshToken, record);
+            await persist();
 
             return c.json({
                 access_token: accessToken,
@@ -362,6 +459,7 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
             });
         }
 
+        console.warn(`Auth: /oauth/token unsupported_grant_type=${JSON.stringify(grantType)}`);
         return c.json({ error: "unsupported_grant_type" }, 400);
     });
 
@@ -379,36 +477,18 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
         },
 
         async saveTokens(): Promise<void> {
-            if (!persistPath) return;
-            try {
-                await mkdir(dirname(persistPath), { recursive: true });
-                const now = Date.now();
-                const activeTokens = [...tokens.entries()].filter(([_, r]) => r.expiresAt > now);
-                const activeRefresh = [...refreshTokens.entries()].filter(([_, r]) => r.refreshExpiresAt > now);
-                const data = JSON.stringify({
-                    tokens: Object.fromEntries(activeTokens),
-                    refreshTokens: Object.fromEntries(activeRefresh),
-                    clients: Object.fromEntries(clients),
-                });
-                await writeFile(persistPath, data, { encoding: "utf-8", mode: 0o600 });
-                await chmod(persistPath, 0o600);
-                console.log(`Auth tokens saved to disk (${tokens.size} sessions).`);
-            } catch (err) {
-                console.error("Failed to save auth tokens:", err);
-            }
+            await persist();
         },
 
         cleanup(): void {
             const now = Date.now();
             for (const [k, r] of tokens) { if (r.expiresAt <= now) tokens.delete(k); }
             for (const [k, r] of refreshTokens) { if (r.refreshExpiresAt <= now) refreshTokens.delete(k); }
-            // Evict clients with no active tokens or refresh tokens
-            const activeClientIds = new Set<string>();
-            for (const r of tokens.values()) activeClientIds.add(r.clientId);
-            for (const r of refreshTokens.values()) activeClientIds.add(r.clientId);
-            for (const [k, c] of clients) {
-                if (!activeClientIds.has(c.clientId)) clients.delete(k);
-            }
+            // Registered clients are NOT evicted here: AI clients cache their
+            // client_id indefinitely and retry it after token expiry, so
+            // dropping a registration means "Unknown client" until the user
+            // deletes and re-adds the connector (issue #13). The clients map
+            // is bounded at registration time instead.
         },
 
         async loadTokens(): Promise<boolean> {
@@ -438,7 +518,17 @@ export function mountPasswordAuth(app: Hono, baseUrl: string, password: string, 
     };
 }
 
-function renderPasswordPage(code: string, csrf: string, error?: string): string {
+function hostOf(uri: string): string {
+    try {
+        return new URL(uri).host;
+    } catch {
+        return uri;
+    }
+}
+
+function renderPasswordPage(code: string, csrf: string, redirectHost: string, clientName: string | undefined, error?: string): string {
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const who = clientName ? `<b>${esc(clientName)}</b> (name self-reported)` : "An application";
     return `<!DOCTYPE html>
 <html><head><title>Obsidian Sync MCP - Authorize</title>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
@@ -448,10 +538,15 @@ function renderPasswordPage(code: string, csrf: string, error?: string): string 
   input[type=password] { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; font-size: 1em; }
   button { padding: 10px 20px; font-size: 1em; cursor: pointer; }
   .error { color: red; }
+  .dest { background: #f3f3f3; padding: 8px 10px; border-radius: 6px; word-break: break-all; }
+  .warn { color: #a15c00; }
 </style></head>
 <body>
   <h1>Obsidian Sync MCP</h1>
-  ${error ? `<p class="error">${error.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>` : "<p>Enter the server password to authorize access to your vault.</p>"}
+  <p>${who} is requesting access to your vault. After you approve, your browser will be sent to:</p>
+  <p class="dest"><b>${esc(redirectHost)}</b></p>
+  <p class="warn">Only enter your password if you recognize this destination. If you did not start this sign-in, close this page.</p>
+  ${error ? `<p class="error">${esc(error)}</p>` : ""}
   <form method="POST" action="/oauth/approve" autocomplete="on">
     <input type="hidden" name="code" value="${code.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">
     <input type="hidden" name="csrf" value="${csrf.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">

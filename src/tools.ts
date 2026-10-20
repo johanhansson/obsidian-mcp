@@ -3,10 +3,41 @@ import { z } from "zod";
 import { makeDeepLink } from "./deeplink.js";
 import type { VaultBackend } from "./vault-backend.js";
 import type { SearchIndex } from "./search.js";
+import { isPathWritable } from "./write-scope.js";
+import { describeListing, describeNoMatch } from "./list-format.js";
+import { describeHits, describeQuery, describeSync, type SyncStatus } from "./search-format.js";
 
 const debugLogging = process.env.LOG_LEVEL === "debug";
 
+/** Runs a CouchDB catch-up before a search; undefined in local (VAULT_PATH) mode. */
+export type SyncBeforeSearch = () => Promise<{ unreadable: number; error?: string }>;
+
+export const SEARCH_MAX_HITS = 20;
+/** Each term is one more regex pass over every note (synchronous), so the count is capped. */
+export const SEARCH_MAX_TERMS = 20;
+/** Each term is compiled into a regex; a very long one overflows the stack (~10 KB with flags iu) or blocks the event loop, so its length is capped. */
+export const SEARCH_MAX_TERM_LENGTH = 200;
+
+/** Trim, drop empty terms, cut each to SEARCH_MAX_TERM_LENGTH and clamp to SEARCH_MAX_TERMS — a backstop behind the schema's .max(). */
+export function cleanSearchTerms(terms: string[] | undefined): string[] {
+    return (terms ?? [])
+        .map((t) => t.trim().slice(0, SEARCH_MAX_TERM_LENGTH))
+        .filter((t) => t.length > 0)
+        .slice(0, SEARCH_MAX_TERMS);
+}
+
 const WRITE_TOOLS = ["write_note", "edit_note", "delete_note", "move_note"] as const;
+
+// Claude Code persists any MCP tool result above ~50 000 characters to a file
+// and hands the model a 2 kB preview instead of the text. A tool can raise its
+// own threshold (hard ceiling 500 000) by declaring
+// `_meta["anthropic/maxResultSizeChars"]` in its tools/list entry; text from
+// such a tool is then also exempt from MAX_MCP_OUTPUT_TOKENS. See
+// https://code.claude.com/docs/en/mcp#raise-the-limit-for-a-specific-tool
+// read_note returns whole notes, so it declares 100 000: enough for a large
+// note to arrive in one piece, small enough to keep one read inside a sane
+// context budget. Other clients ignore the key.
+export const READ_NOTE_MAX_RESULT_SIZE_CHARS = 100_000;
 
 export function registerTools(
     server: FastMCP,
@@ -14,10 +45,19 @@ export function registerTools(
     searchIndex: SearchIndex,
     vaultName: string,
     readOnly = false,
+    writeFolders: string[] | null = null,
+    syncBeforeSearch?: SyncBeforeSearch,
 ) {
     if (readOnly) {
         console.log(`READ_ONLY mode: write tools disabled (${WRITE_TOOLS.join(", ")}).`);
+    } else if (writeFolders) {
+        console.log(`WRITE_FOLDERS: writes restricted to ${writeFolders.map((f) => f + "/").join(", ")}.`);
     }
+    const writeScopeNote = writeFolders
+        ? ` Writes are only allowed inside: ${writeFolders.map((f) => f + "/").join(", ")}.`
+        : "";
+    const denyWrite = (path: string) =>
+        `Write access denied: '${path}' is outside the writable folders (${writeFolders!.map((f) => f + "/").join(", ")}).`;
     const _addTool = server.addTool.bind(server);
     server.addTool = (tool: any) => {
         const original = tool.execute;
@@ -34,6 +74,7 @@ export function registerTools(
         name: "read_note",
         description:
             "Read the content of a note from the Obsidian vault. Returns the markdown content and a deep link to open it in Obsidian.",
+        _meta: { "anthropic/maxResultSizeChars": READ_NOTE_MAX_RESULT_SIZE_CHARS },
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
         }),
@@ -50,12 +91,13 @@ export function registerTools(
     if (!readOnly) server.addTool({
         name: "write_note",
         description:
-            "Write or update a note in the Obsidian vault. Creates the note if it doesn't exist. Replaces the entire content if it does — read first if you need to preserve existing content.",
+            "Write or update a note in the Obsidian vault. Creates the note if it doesn't exist. Replaces the entire content if it does — read first if you need to preserve existing content." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-23.md'"),
             content: z.string().describe("Full markdown content for the note"),
         }),
         execute: async ({ path, content }) => {
+            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
             const ok = await vault.writeNote(path, content);
             if (!ok) {
                 return `Failed to write note: ${path}`;
@@ -98,39 +140,124 @@ export function registerTools(
         execute: async ({ folder, name, tag, sort_by, modified_after, limit }) => {
             // Use search index (works with encrypted vaults), fall back to vault
             let notes = searchIndex.listWithMtime(folder);
+            let vaultTotal: number | null = searchIndex.size;
+            let servedByVault = false;
             if (notes.length === 0) {
                 notes = await vault.listNotesWithMtime(folder);
+                servedByVault = notes.length > 0;
+                // The fallback only tells us the vault total when it was unscoped.
+                if (vaultTotal === 0) vaultTotal = folder ? null : notes.length;
             }
+            const folderTotal = folder ? notes.length : null;
+            const filters: string[] = [];
             if (name) {
                 const lower = name.toLowerCase();
                 notes = notes.filter((n) => n.path.toLowerCase().includes(lower));
+                filters.push(`name="${name}"`);
             }
             if (tag) {
                 notes = notes.filter((n) => searchIndex.getTags(n.path).includes(tag));
+                filters.push(`tag="${tag}"`);
             }
             if (modified_after) {
                 const cutoff = new Date(modified_after).getTime();
                 if (isNaN(cutoff)) return `Invalid date format: ${modified_after}. Use ISO format like '2026-03-25'.`;
                 notes = notes.filter((n) => n.mtime >= cutoff);
+                filters.push(`modified_after="${modified_after}"`);
             }
+            const index = { state: searchIndex.state, size: searchIndex.size, servedByVault };
             if (notes.length === 0) {
-                return folder ? `No notes found in folder: ${folder}` : "Vault is empty.";
+                return describeNoMatch({ vaultTotal, folder, folderTotal, filters, index });
             }
-            if (sort_by === "modified") {
+            const sortBy = sort_by === "modified" ? "modified" : "name";
+            if (sortBy === "modified") {
                 notes.sort((a, b) => b.mtime - a.mtime);
             }
             const cap = limit ?? 100;
             const total = notes.length;
             const capped = notes.slice(0, cap);
+            const header = describeListing({
+                shown: capped.length,
+                matched: total,
+                vaultTotal,
+                folder,
+                folderTotal,
+                filters,
+                sortBy,
+                limit: cap,
+                omitted: notes.slice(cap).map((n) => n.path),
+                index,
+            });
             const lines = capped.map((n) => {
                 const deepLink = makeDeepLink(vaultName, n.path);
                 const date = n.mtime ? new Date(n.mtime).toISOString().slice(0, 16) : "";
                 return `- ${date} [${n.path}](${deepLink})`;
             });
-            if (total > cap) {
-                lines.push(`\n... and ${total - cap} more. Use a folder filter or limit to narrow results.`);
+            return [header, ...lines].join("\n");
+        },
+    });
+
+    server.addTool({
+        name: "search_notes",
+        description:
+            "Search note contents for terms, case-insensitive.\n" +
+            "Paths and frontmatter titles are searched first and such hits rank on top, marked [path/title]; content hits follow. " +
+            "Returns paths with one context line each, never the note body: call read_note on a hit before relying on it. " +
+            "Give `terms` (a note matches when ANY term occurs — OR, so list synonyms, field names and other-language wordings; a term may contain spaces; ranked by how many terms match) " +
+            "Filters: folder, tag, modified_after. " +
+            "The first line of every response is the index status: the CouchDB sequence the index is caught up with after a catch-up run just before the search, " +
+            "the server time (local zone and UTC), its age in minutes, how many notes carry content, and any documents that could not be read.",
+        parameters: z.object({
+            terms: z
+                .array(z.string().max(SEARCH_MAX_TERM_LENGTH))
+                .max(SEARCH_MAX_TERMS)
+                .optional()
+                .describe(`Case-insensitive substrings, at most ${SEARCH_MAX_TERMS} of at most ${SEARCH_MAX_TERM_LENGTH} characters each; a note matches when any of them occurs. E.g. ['drag i kanban', 'kanban', 'labels på kategori'].`),
+            folder: z
+                .string()
+                .optional()
+                .describe("Folder to search in, e.g. 'projects'. Omit for the whole vault."),
+            tag: z
+                .string()
+                .optional()
+                .describe("Only notes carrying this tag, e.g. 'project'."),
+            modified_after: z
+                .string()
+                .optional()
+                .describe("Only notes modified after this ISO date, e.g. '2026-03-25' or '2026-03-25T10:00'."),
+            limit: z.coerce
+                .number()
+                .optional()
+                .describe(`Max hits to return, default and maximum ${SEARCH_MAX_HITS}.`),
+        }),
+        execute: async ({ terms, folder, tag, modified_after, limit }) => {
+            const cleanTerms = cleanSearchTerms(terms);
+            if (cleanTerms.length === 0) {
+                return "Give at least one term.";
             }
-            return lines.join("\n");
+            let modifiedAfter: number | undefined;
+            if (modified_after) {
+                modifiedAfter = new Date(modified_after).getTime();
+                if (isNaN(modifiedAfter)) return `Invalid date format: ${modified_after}. Use ISO format like '2026-03-25'.`;
+            }
+            const cap = Math.max(1, Math.min(SEARCH_MAX_HITS, limit ?? SEARCH_MAX_HITS));
+
+            // Catch up first, so a hit can never predate the vault (see main.ts).
+            const sync = syncBeforeSearch ? await syncBeforeSearch() : { unreadable: 0 };
+            const status: SyncStatus = {
+                mode: syncBeforeSearch ? "couchdb" : "local",
+                state: searchIndex.state,
+                seq: searchIndex.since,
+                syncedAt: searchIndex.lastSyncAt,
+                now: Date.now(),
+                notes: searchIndex.size,
+                withContent: searchIndex.contentCount,
+                unreadable: sync.unreadable,
+                error: sync.error,
+            };
+            const { hits, total } = searchIndex.search({ terms: cleanTerms, folder, tag, modifiedAfter, limit: cap });
+            const query = describeQuery(cleanTerms);
+            return `${describeSync(status)}\n${describeHits(hits, total, query, (p) => makeDeepLink(vaultName, p))}`;
         },
     });
 
@@ -187,7 +314,7 @@ export function registerTools(
     if (!readOnly) server.addTool({
         name: "edit_note",
         description:
-            "Edit a note without rewriting it. Use 'append' (default) to add content to the end, 'prepend' to add after frontmatter, or 'replace' to swap old_text with new content. For replace, the old_text must match exactly once.",
+            "Edit a note without rewriting it. Use 'append' (default) to add content to the end, 'prepend' to add after frontmatter, or 'replace' to swap old_text with new content. For replace, the old_text must match exactly once." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note, e.g. 'daily/2026-03-25.md'"),
             content: z.string().describe("Text to append, prepend, or use as replacement for old_text"),
@@ -201,6 +328,7 @@ export function registerTools(
                 .describe("Required for replace operation. Exact text to find and replace. Must match exactly once."),
         }),
         execute: async ({ path, content: newContent, operation, old_text }) => {
+            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
             const existing = await vault.readNote(path);
             if (existing === null) {
                 return `Note not found: ${path}`;
@@ -247,11 +375,17 @@ export function registerTools(
 
     if (!readOnly) server.addTool({
         name: "delete_note",
-        description: "Delete a note from the Obsidian vault.",
+        description: "Delete a note from the Obsidian vault." + writeScopeNote,
         parameters: z.object({
             path: z.string().describe("Vault-relative path to the note to delete"),
         }),
         execute: async ({ path }) => {
+            if (!isPathWritable(path, writeFolders)) return denyWrite(path);
+            // The sync layer reports success even when nothing existed at the
+            // path, so "Deleted" would claim a cleanup that never happened.
+            // readNote returns "" for an empty note and null only when absent.
+            const existing = await vault.readNote(path);
+            if (existing === null) return `Note not found: ${path}`;
             const ok = await vault.deleteNote(path);
             if (ok) searchIndex.remove(path);
             return ok ? `Deleted: ${path}` : `Failed to delete: ${path}`;
@@ -261,12 +395,15 @@ export function registerTools(
     if (!readOnly) server.addTool({
         name: "move_note",
         description:
-            "Move or rename a note. Use this to rename a note within the same folder, move it to a different folder, or both at once. Creates destination folders automatically.",
+            "Move or rename a note. Use this to rename a note within the same folder, move it to a different folder, or both at once. Creates destination folders automatically." + writeScopeNote,
         parameters: z.object({
             from: z.string().describe("Current path, e.g. 'daily/old-name.md'"),
             to: z.string().describe("New path, e.g. 'projects/new-name.md'"),
         }),
         execute: async ({ from, to }) => {
+            // Moving out of a folder deletes there; moving in writes there — both ends must be writable.
+            if (!isPathWritable(from, writeFolders)) return denyWrite(from);
+            if (!isPathWritable(to, writeFolders)) return denyWrite(to);
             const content = await vault.readNote(from);
             const ok = await vault.moveNote(from, to);
             if (!ok) {
